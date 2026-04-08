@@ -59,7 +59,7 @@ app.use('/api/warnings', warningsRouter)
 app.use('/uploads', express.static(path.resolve(process.cwd(), 'uploads')))
 
 // Serve built React frontend (production only)
-const distPath = path.resolve(process.cwd(), '..', 'client', 'dist')
+const distPath = path.resolve(process.cwd(), 'client', 'dist')
 app.use(express.static(distPath))
 app.get('*', (_req, res) => {
   res.sendFile(path.join(distPath, 'index.html'))
