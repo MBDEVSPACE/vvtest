@@ -80,7 +80,10 @@ router.put('/branding', requireAuth, requirePermission('ti.admin.manage_permissi
     discordLogChannelId: canChangeDiscordChannel ? req.body.discordLogChannelId : undefined,
     discordBotToken: canChangeDiscordChannel ? req.body.discordBotToken : undefined,
     discordGuildId: canChangeDiscordChannel ? req.body.discordGuildId : undefined,
-    discordBannedRoles: canChangeDiscordChannel ? req.body.discordBannedRoles : undefined
+    discordBannedRoles: canChangeDiscordChannel ? req.body.discordBannedRoles : undefined,
+    discordReportWebhook: canChangeDiscordChannel ? req.body.discordReportWebhook : undefined,
+    discordAuditWebhook: canChangeDiscordChannel ? req.body.discordAuditWebhook : undefined,
+    discordSecurityWebhook: canChangeDiscordChannel ? req.body.discordSecurityWebhook : undefined
   })
 
   await writeAdminLog({

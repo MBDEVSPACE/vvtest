@@ -10,14 +10,17 @@ const DEFAULT_SETTINGS = {
   discord_log_channel_id: '',
   discord_bot_token: '',
   discord_guild_id: '',
-  discord_banned_roles: ''
+  discord_banned_roles: '',
+  discord_report_webhook: '',
+  discord_audit_webhook: '',
+  discord_security_webhook: ''
 }
 
 export async function getPanelSettings() {
   const rows = await query(
     `SELECT setting_key, setting_value
      FROM ti_web_panel_settings
-     WHERE setting_key IN ('panel_title', 'panel_subtitle', 'panel_logo_url', 'hero_logo_url', 'color_scheme', 'discord_logs_enabled', 'discord_log_channel_id', 'discord_bot_token', 'discord_guild_id', 'discord_banned_roles')`
+     WHERE setting_key IN ('panel_title', 'panel_subtitle', 'panel_logo_url', 'hero_logo_url', 'color_scheme', 'discord_logs_enabled', 'discord_log_channel_id', 'discord_bot_token', 'discord_guild_id', 'discord_banned_roles', 'discord_report_webhook', 'discord_audit_webhook', 'discord_security_webhook')`
   )
 
   const mapped = rows.reduce((accumulator, row) => {
@@ -37,7 +40,10 @@ export async function getPanelSettings() {
     discordGuildId: mapped.discord_guild_id || '',
     discordBannedRoles: (() => {
       try { return JSON.parse(mapped.discord_banned_roles || '[]') } catch { return [] }
-    })()
+    })(),
+    discordReportWebhook: mapped.discord_report_webhook || '',
+    discordAuditWebhook: mapped.discord_audit_webhook || '',
+    discordSecurityWebhook: mapped.discord_security_webhook || ''
   }
 }
 
@@ -57,7 +63,10 @@ export async function savePanelSettings(input) {
       const raw = input.discordBannedRoles
       if (Array.isArray(raw)) return JSON.stringify(raw.map(String).filter(Boolean))
       try { const parsed = JSON.parse(raw); return JSON.stringify(Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : []) } catch { return '[]' }
-    })()]
+    })()],
+    ['discord_report_webhook', input.discordReportWebhook === undefined ? current.discordReportWebhook : String(input.discordReportWebhook || '').trim().slice(0, 512)],
+    ['discord_audit_webhook', input.discordAuditWebhook === undefined ? current.discordAuditWebhook : String(input.discordAuditWebhook || '').trim().slice(0, 512)],
+    ['discord_security_webhook', input.discordSecurityWebhook === undefined ? current.discordSecurityWebhook : String(input.discordSecurityWebhook || '').trim().slice(0, 512)]
   ]
 
   for (const [key, value] of values) {
