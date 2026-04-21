@@ -578,19 +578,107 @@ router.post('/player/set-job', requireAuth, requirePermission('ti.admin.manage_p
   }
 })
 
+// POST /api/admin/player-action
+// Runs a targeted in-game admin action (spectate / goto / bring / sendBack / gotoBack)
+// on behalf of the signed-in panel user who must also be in-game.
+router.post('/player-action', requireAuth, requirePermission('ti.map.view'), async (req, res) => {
+  const ALLOWED = ['spectate', 'goto', 'bring', 'sendBack', 'gotoBack']
+  const action    = String(req.body.action    || '').trim()
+  const targetSrc = req.body.targetSrc != null ? Number(req.body.targetSrc) : null
+  if (!ALLOWED.includes(action)) return res.status(400).json({ error: 'invalid_action' })
+  try {
+    const data = await callFivem('/player-action', 'POST', {
+      adminIdentifier: req.user.identifier,
+      action,
+      targetSrc,
+    }, 5000)
+    res.json(data)
+  } catch (err) {
+    res.status(502).json({ error: 'fivem_unreachable', detail: err.message })
+  }
+})
+
+// GET /api/admin/map-snapshot
+// Returns live player positions with roles directly from the FiveM server.
+// Bypasses the DB entirely — no need for ti_player_locs migration.
+router.get('/map-snapshot', requireAuth, requirePermission('ti.map.view'), async (_req, res) => {
+  try {
+    const players = await callFivem('/map-snapshot', 'GET', null, 4000)
+    // Normalise to { src, name, role, coords: {x,y,z}, ... }
+    const mapped = (Array.isArray(players) ? players : []).map((p) => ({
+      src:     p.src,
+      name:    p.name,
+      role:    p.role || 'user',
+      inVeh:   p.inVeh  || false,
+      isDead:  p.isDead || false,
+      ping:    p.ping   || 0,
+      job:     p.job    || '',
+      onDuty:  p.onDuty || false,
+      coords:  { x: p.x || 0, y: p.y || 0, z: p.z || 0 },
+    }))
+    res.json({ players: mapped })
+  } catch (err) {
+    res.status(502).json({ error: 'fivem_unreachable', detail: err.message })
+  }
+})
+
 // POST /api/admin/broadcast
 router.post('/broadcast', requireAuth, requirePermission('ti.admin.manage_permissions'), async (req, res) => {
   const message = String(req.body.message || '').trim().slice(0, 512)
+  const color   = String(req.body.color || 'info').slice(0, 16)
+  const icon    = String(req.body.icon  || 'fa-solid fa-bullhorn').slice(0, 96)
   if (!message) return res.status(400).json({ error: 'message_required' })
   try {
-    await callFivem('/broadcast', 'POST', { message })
-    await writeAdminLog({ req, action: 'web_broadcast', target: 'all', details: { message },
+    await callFivem('/broadcast', 'POST', { message, color, icon })
+    await writeAdminLog({ req, action: 'web_broadcast', target: 'all', details: { message, color, icon },
       discordEmbed: { title: 'Server Announcement', color: 3447003,
-        fields: [{ name: 'Admin', value: req.user.name, inline: true }, { name: 'Message', value: message }] }
+        fields: [{ name: 'Admin', value: req.user.name, inline: true }, { name: 'Color', value: color, inline: true }, { name: 'Message', value: message }] }
     })
     res.json({ ok: true })
   } catch (err) {
     res.status(502).json({ error: 'fivem_unreachable', detail: err.message })
+  }
+})
+
+// GET /api/admin/all-players?search=&limit=100
+// Returns recently-seen players (online + offline) from session history.
+// Online flag is derived from last_seen_at freshness.
+router.get('/all-players', requireAuth, requirePermission('ti.ban.view'), async (req, res) => {
+  const search = String(req.query.search || '').trim().slice(0, 80)
+  const limit  = Math.min(parseInt(req.query.limit) || 100, 200)
+  try {
+    const searchClause = search ? `AND (lps.player_name LIKE ? OR lps.primary_identifier LIKE ?)` : ''
+    const searchArgs   = search ? [`%${search}%`, `%${search}%`] : []
+    const rows = await query(
+      `SELECT lps.player_src, lps.player_name, lps.primary_identifier,
+              GROUP_CONCAT(lsi.identifier ORDER BY lsi.identifier SEPARATOR ',') AS identifiers,
+              lps.last_seen_at, lps.disconnected_at,
+              (lps.disconnected_at IS NULL AND lps.last_seen_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 3 MINUTE)) AS is_online
+       FROM ti_live_player_sessions lps
+       LEFT JOIN ti_live_player_session_identifiers lsi ON lsi.session_id = lps.id
+       WHERE 1=1 ${searchClause}
+       GROUP BY lps.id
+       ORDER BY lps.last_seen_at DESC
+       LIMIT ?`,
+      [...searchArgs, limit]
+    )
+    const players = rows.map((row) => {
+      const idList = String(row.identifiers || '').split(',').filter(Boolean)
+      if (!idList.length && row.primary_identifier) idList.push(row.primary_identifier)
+      return {
+        src:          row.is_online ? row.player_src : null,
+        name:         row.player_name,
+        identifier:   row.primary_identifier,
+        identifiers:  idList,
+        is_online:    Boolean(row.is_online),
+        last_seen_at: row.last_seen_at,
+        coords:       null,
+      }
+    })
+    res.json({ players })
+  } catch (err) {
+    console.error('[web-panel] all-players query failed', err)
+    res.status(500).json({ error: 'internal_error', detail: err?.message })
   }
 })
 
