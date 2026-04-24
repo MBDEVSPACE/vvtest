@@ -30,7 +30,7 @@ async function getAccessPayload(req) {
 
   const [roles, assignments] = await Promise.all([
     query(
-      `SELECT r.id, r.name, r.label, r.weight, r.is_super,
+      `SELECT r.id, r.name, r.label, r.weight, r.is_super, r.color,
               COALESCE(GROUP_CONCAT(DISTINCT p.permission ORDER BY p.permission SEPARATOR ','), '') AS permissions
        FROM ti_admin_roles r
        LEFT JOIN ti_admin_permissions p ON p.role_id = r.id
@@ -52,6 +52,7 @@ async function getAccessPayload(req) {
     roles: roles.map((role) => ({
       ...role,
       is_super: Number(role.is_super || 0) === 1,
+      color: role.color || '#9db0be',
       permissions: String(role.permissions || '')
         .split(',')
         .map((value) => value.trim())
@@ -151,6 +152,7 @@ router.put('/roles/:roleId', requireAuth, requirePermission('ti.admin.manage_per
   const label = String(req.body.label || '').trim().slice(0, 64)
   const weight = Number(req.body.weight || 0)
   const isSuper = req.body.is_super ? 1 : 0
+  const color = /^#[0-9a-fA-F]{3,8}$/.test(req.body.color || '') ? req.body.color : null
   const permissions = Array.isArray(req.body.permissions)
     ? req.body.permissions.map((value) => String(value || '').trim()).filter(Boolean)
     : []
@@ -162,9 +164,11 @@ router.put('/roles/:roleId', requireAuth, requirePermission('ti.admin.manage_per
 
   await query(
     `UPDATE ti_admin_roles
-     SET name = ?, label = ?, weight = ?, is_super = ?
+     SET name = ?, label = ?, weight = ?, is_super = ?${color !== null ? ', color = ?' : ''}
      WHERE id = ?`,
-    [name || roleRows[0].name, label || roleRows[0].name, weight, isSuper, roleId]
+    color !== null
+      ? [name || roleRows[0].name, label || roleRows[0].name, weight, isSuper, color, roleId]
+      : [name || roleRows[0].name, label || roleRows[0].name, weight, isSuper, roleId]
   )
 
   await writeRolePermissions(roleId, permissions)
@@ -173,7 +177,7 @@ router.put('/roles/:roleId', requireAuth, requirePermission('ti.admin.manage_per
     req,
     action: 'web_role_update',
     target: String(roleId),
-    details: { name, label, weight, isSuper, permissions },
+    details: { name, label, weight, isSuper, color, permissions },
     discordMessage: `[Admin Panel] ${req.user.name} updated role #${roleId}`
   })
 
@@ -185,6 +189,7 @@ router.post('/roles', requireAuth, requirePermission('ti.admin.manage_permission
   const label = String(req.body.label || '').trim().slice(0, 64)
   const weight = Number(req.body.weight || 0)
   const isSuper = req.body.is_super ? 1 : 0
+  const color = /^#[0-9a-fA-F]{3,8}$/.test(req.body.color || '') ? req.body.color : '#9db0be'
   const permissions = Array.isArray(req.body.permissions)
     ? req.body.permissions.map((value) => String(value || '').trim()).filter(Boolean)
     : []
@@ -194,9 +199,9 @@ router.post('/roles', requireAuth, requirePermission('ti.admin.manage_permission
   }
 
   const result = await query(
-    `INSERT INTO ti_admin_roles (name, label, weight, is_super)
-     VALUES (?, ?, ?, ?)`,
-    [name, label, weight, isSuper]
+    `INSERT INTO ti_admin_roles (name, label, weight, is_super, color)
+     VALUES (?, ?, ?, ?, ?)`,
+    [name, label, weight, isSuper, color]
   )
 
   await writeRolePermissions(result.insertId, permissions)
@@ -205,7 +210,7 @@ router.post('/roles', requireAuth, requirePermission('ti.admin.manage_permission
     req,
     action: 'web_role_create',
     target: String(result.insertId),
-    details: { name, label, weight, isSuper, permissions },
+    details: { name, label, weight, isSuper, color, permissions },
     discordMessage: `[Admin Panel] ${req.user.name} created role ${label}`
   })
 
@@ -367,39 +372,122 @@ router.get('/online-players', requireAuth, requirePermission('ti.ban.view'), asy
 })
 
 // GET /api/admin/stats/staff?period=all|30d|7d
-// Aggregated action counts per staff member from the audit log.
+// Aggregated action counts + playtime per staff member from audit log + sessions.
 router.get('/stats/staff', requireAuth, requirePermission('ti.audit.view'), async (req, res) => {
   const period = String(req.query.period || 'all').toLowerCase()
-  const periodWhere =
-    period === '7d'  ? 'AND created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)' :
-    period === '30d' ? 'AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)' :
+  const periodWhereAl =
+    period === '7d'  ? 'AND al.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)' :
+    period === '30d' ? 'AND al.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)' :
+    ''
+  const periodWhereSessions =
+    period === '7d'  ? 'AND s.connected_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)' :
+    period === '30d' ? 'AND s.connected_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)' :
     ''
 
+  // Sessions are capped at 8 h each to approximate AFK-free playtime
   const rows = await query(`
     SELECT
-      actor_name,
-      actor_identifier,
+      al.actor_name,
+      al.actor_identifier,
       COUNT(*) AS total_actions,
-      SUM(CASE WHEN action IN ('ban_create','tiban_command','ban_create_offline','offline_ban_create','web_ban_create') THEN 1 ELSE 0 END) AS bans_issued,
-      SUM(CASE WHEN action IN ('ban_unban','web_ban_unban') THEN 1 ELSE 0 END) AS unbans,
-      SUM(CASE WHEN action = 'kick' THEN 1 ELSE 0 END) AS kicks,
-      SUM(CASE WHEN action = 'warn' THEN 1 ELSE 0 END) AS warns,
-      SUM(CASE WHEN action = 'screenshot' THEN 1 ELSE 0 END) AS screenshots,
-      SUM(CASE WHEN action = 'report_create' THEN 1 ELSE 0 END) AS reports_submitted,
-      SUM(CASE WHEN action IN ('report_status','report_claim','report_note') THEN 1 ELSE 0 END) AS reports_handled,
-      SUM(CASE WHEN action LIKE 'report_%' THEN 1 ELSE 0 END) AS report_actions,
-      SUM(CASE WHEN action IN ('offline_ban_create','ban_create_offline') THEN 1 ELSE 0 END) AS offline_bans,
-      SUM(CASE WHEN action = 'mute' THEN 1 ELSE 0 END) AS mutes,
-      MIN(created_at) AS first_action_at,
-      MAX(created_at) AS last_action_at
-    FROM ti_audit_logs
-    WHERE actor_identifier NOT IN ('system', '')
-    ${periodWhere}
-    GROUP BY actor_identifier, actor_name
+      SUM(CASE WHEN al.action IN ('ban_create','tiban_command','ban_create_offline','offline_ban_create','web_ban_create') THEN 1 ELSE 0 END) AS bans_issued,
+      SUM(CASE WHEN al.action IN ('ban_unban','web_ban_unban') THEN 1 ELSE 0 END) AS unbans,
+      SUM(CASE WHEN al.action = 'kick' THEN 1 ELSE 0 END) AS kicks,
+      SUM(CASE WHEN al.action = 'warn' THEN 1 ELSE 0 END) AS warns,
+      SUM(CASE WHEN al.action = 'screenshot' THEN 1 ELSE 0 END) AS screenshots,
+      SUM(CASE WHEN al.action = 'report_create' THEN 1 ELSE 0 END) AS reports_submitted,
+      SUM(CASE WHEN al.action IN ('report_status','report_claim','report_note') THEN 1 ELSE 0 END) AS reports_handled,
+      SUM(CASE WHEN al.action LIKE 'report_%' THEN 1 ELSE 0 END) AS report_actions,
+      SUM(CASE WHEN al.action IN ('offline_ban_create','ban_create_offline') THEN 1 ELSE 0 END) AS offline_bans,
+      SUM(CASE WHEN al.action = 'mute' THEN 1 ELSE 0 END) AS mutes,
+      SUM(CASE WHEN al.action = 'report_claim' THEN 1 ELSE 0 END) AS reports_claimed,
+      SUM(CASE WHEN al.action = 'report_status'
+               AND JSON_UNQUOTE(JSON_EXTRACT(al.details, '$.status')) = 'closed'
+               THEN 1 ELSE 0 END) AS reports_closed,
+      MIN(al.created_at) AS first_action_at,
+      MAX(al.created_at) AS last_action_at,
+      (
+        SELECT COALESCE(SUM(LEAST(
+          TIMESTAMPDIFF(SECOND, s.connected_at, COALESCE(s.disconnected_at, UTC_TIMESTAMP())),
+          28800
+        )), 0)
+        FROM ti_live_player_sessions s
+        WHERE s.primary_identifier = al.actor_identifier
+        ${periodWhereSessions}
+      ) AS playtime_seconds,
+      (SELECT COUNT(*) FROM ti_bans b WHERE b.created_by_identifier = al.actor_identifier AND b.revoked_at IS NOT NULL) AS bans_revoked_total,
+      (SELECT COUNT(*) FROM ti_bans b WHERE b.created_by_identifier = al.actor_identifier) AS bans_total
+    FROM ti_audit_logs al
+    WHERE al.actor_identifier NOT IN ('system', '')
+    ${periodWhereAl}
+    GROUP BY al.actor_identifier, al.actor_name
     ORDER BY total_actions DESC
     LIMIT 100
   `)
   res.json({ rows, period })
+})
+
+// GET /api/admin/stats/reports
+// Overall report statistics: overview totals, by-type breakdown, top closers (7d + 30d).
+router.get('/stats/reports', requireAuth, requirePermission('ti.audit.view'), async (req, res) => {
+  const [overviewRows, byType, topClosers7d, topClosers30d] = await Promise.all([
+    query(`
+      SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN status IN ('open','claimed','in_progress') THEN 1 ELSE 0 END) AS open_count,
+        SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed_total,
+        SUM(CASE WHEN status = 'closed' AND updated_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 DAY)  THEN 1 ELSE 0 END) AS closed_today,
+        SUM(CASE WHEN status = 'closed' AND updated_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 7 DAY)  THEN 1 ELSE 0 END) AS closed_7d,
+        SUM(CASE WHEN status = 'closed' AND updated_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 30 DAY) THEN 1 ELSE 0 END) AS closed_30d,
+        ROUND(AVG(CASE WHEN status = 'closed' THEN TIMESTAMPDIFF(MINUTE, created_at, updated_at) ELSE NULL END) / 60, 1) AS avg_resolution_hours
+      FROM ti_reports
+    `),
+    query(`
+      SELECT report_type,
+        COUNT(*) AS total,
+        SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed,
+        SUM(CASE WHEN status IN ('open','claimed','in_progress') THEN 1 ELSE 0 END) AS open_count
+      FROM ti_reports
+      GROUP BY report_type
+      ORDER BY total DESC
+    `),
+    query(`
+      SELECT al.actor_name, al.actor_identifier,
+        SUM(CASE WHEN al.action = 'report_claim' THEN 1 ELSE 0 END) AS claimed,
+        SUM(CASE WHEN al.action = 'report_status'
+             AND JSON_UNQUOTE(JSON_EXTRACT(al.details, '$.status')) = 'closed'
+             THEN 1 ELSE 0 END) AS closed
+      FROM ti_audit_logs al
+      WHERE al.actor_identifier NOT IN ('system','')
+        AND al.action IN ('report_claim','report_status')
+        AND al.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+      GROUP BY al.actor_identifier, al.actor_name
+      HAVING (claimed > 0 OR closed > 0)
+      ORDER BY closed DESC, claimed DESC
+      LIMIT 10
+    `),
+    query(`
+      SELECT al.actor_name, al.actor_identifier,
+        SUM(CASE WHEN al.action = 'report_claim' THEN 1 ELSE 0 END) AS claimed,
+        SUM(CASE WHEN al.action = 'report_status'
+             AND JSON_UNQUOTE(JSON_EXTRACT(al.details, '$.status')) = 'closed'
+             THEN 1 ELSE 0 END) AS closed
+      FROM ti_audit_logs al
+      WHERE al.actor_identifier NOT IN ('system','')
+        AND al.action IN ('report_claim','report_status')
+        AND al.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+      GROUP BY al.actor_identifier, al.actor_name
+      HAVING (claimed > 0 OR closed > 0)
+      ORDER BY closed DESC, claimed DESC
+      LIMIT 10
+    `)
+  ])
+
+  res.json({
+    overview: overviewRows[0] || {},
+    byType,
+    topClosers: { '7d': topClosers7d, '30d': topClosers30d }
+  })
 })
 
 // ─── Shared helper: proxy a request to the FiveM game server ─────────────────
