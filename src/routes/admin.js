@@ -351,7 +351,31 @@ router.get('/online-players', requireAuth, requirePermission('ti.ban.view'), asy
         throw coordErr
       }
     }
-    res.json({ players: mapRows(rows) })
+    const players = mapRows(rows)
+
+    // ── FiveM fallback ────────────────────────────────────────────────────────
+    // If the sessions table is empty (resource not yet writing sessions), fall
+    // back to the live FiveM map-snapshot so the players list is never blank
+    // while the server is reachable.
+    if (players.length === 0) {
+      try {
+        const snap = await callFivem('/map-snapshot', 'GET', null, 3000)
+        if (Array.isArray(snap) && snap.length > 0) {
+          return res.json({
+            players: snap.map(p => ({
+              src:         p.src,
+              name:        p.name,
+              identifier:  '',
+              identifiers: [],
+              coords:      p.x != null ? { x: p.x, y: p.y, z: p.z } : null,
+            })),
+            _source: 'fivem_fallback',
+          })
+        }
+      } catch { /* non-fatal — FiveM may be unreachable */ }
+    }
+
+    res.json({ players })
   } catch (err) {
     console.error('[web-panel] online-players query failed', err)
     const msg = String(err?.message || '').toLowerCase()
@@ -372,39 +396,134 @@ router.get('/online-players', requireAuth, requirePermission('ti.ban.view'), asy
 })
 
 // GET /api/admin/stats/staff?period=all|30d|7d
-// Aggregated action counts per staff member from the audit log.
+// Aggregated action counts + playtime per staff member from audit log + sessions.
 router.get('/stats/staff', requireAuth, requirePermission('ti.audit.view'), async (req, res) => {
   const period = String(req.query.period || 'all').toLowerCase()
-  const periodWhere =
-    period === '7d'  ? 'AND created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)' :
-    period === '30d' ? 'AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)' :
+  const periodWhereAl =
+    period === '7d'  ? 'AND al.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)' :
+    period === '30d' ? 'AND al.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)' :
+    ''
+  const periodWhereSessions =
+    period === '7d'  ? 'AND s.connected_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)' :
+    period === '30d' ? 'AND s.connected_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)' :
     ''
 
+  // Sessions are capped at 8 h each to approximate AFK-free playtime
   const rows = await query(`
     SELECT
-      actor_name,
-      actor_identifier,
+      al.actor_name,
+      al.actor_identifier,
+      (
+        SELECT GROUP_CONCAT(DISTINCT lsi.identifier ORDER BY lsi.identifier SEPARATOR ',')
+        FROM ti_live_player_sessions lps2
+        JOIN ti_live_player_session_identifiers lsi ON lsi.session_id = lps2.id
+        WHERE lps2.primary_identifier = al.actor_identifier
+        LIMIT 1
+      ) AS all_identifiers,
       COUNT(*) AS total_actions,
-      SUM(CASE WHEN action IN ('ban_create','tiban_command','ban_create_offline','offline_ban_create','web_ban_create') THEN 1 ELSE 0 END) AS bans_issued,
-      SUM(CASE WHEN action IN ('ban_unban','web_ban_unban') THEN 1 ELSE 0 END) AS unbans,
-      SUM(CASE WHEN action = 'kick' THEN 1 ELSE 0 END) AS kicks,
-      SUM(CASE WHEN action = 'warn' THEN 1 ELSE 0 END) AS warns,
-      SUM(CASE WHEN action = 'screenshot' THEN 1 ELSE 0 END) AS screenshots,
-      SUM(CASE WHEN action = 'report_create' THEN 1 ELSE 0 END) AS reports_submitted,
-      SUM(CASE WHEN action IN ('report_status','report_claim','report_note') THEN 1 ELSE 0 END) AS reports_handled,
-      SUM(CASE WHEN action LIKE 'report_%' THEN 1 ELSE 0 END) AS report_actions,
-      SUM(CASE WHEN action IN ('offline_ban_create','ban_create_offline') THEN 1 ELSE 0 END) AS offline_bans,
-      SUM(CASE WHEN action = 'mute' THEN 1 ELSE 0 END) AS mutes,
-      MIN(created_at) AS first_action_at,
-      MAX(created_at) AS last_action_at
-    FROM ti_audit_logs
-    WHERE actor_identifier NOT IN ('system', '')
-    ${periodWhere}
-    GROUP BY actor_identifier, actor_name
+      SUM(CASE WHEN al.action IN ('ban_create','tiban_command','ban_create_offline','offline_ban_create','web_ban_create') THEN 1 ELSE 0 END) AS bans_issued,
+      SUM(CASE WHEN al.action IN ('ban_unban','web_ban_unban') THEN 1 ELSE 0 END) AS unbans,
+      SUM(CASE WHEN al.action = 'kick' THEN 1 ELSE 0 END) AS kicks,
+      SUM(CASE WHEN al.action = 'warn' THEN 1 ELSE 0 END) AS warns,
+      SUM(CASE WHEN al.action = 'screenshot' THEN 1 ELSE 0 END) AS screenshots,
+      SUM(CASE WHEN al.action = 'report_create' THEN 1 ELSE 0 END) AS reports_submitted,
+      SUM(CASE WHEN al.action IN ('report_status','report_claim','report_note') THEN 1 ELSE 0 END) AS reports_handled,
+      SUM(CASE WHEN al.action LIKE 'report_%' THEN 1 ELSE 0 END) AS report_actions,
+      SUM(CASE WHEN al.action IN ('offline_ban_create','ban_create_offline') THEN 1 ELSE 0 END) AS offline_bans,
+      SUM(CASE WHEN al.action = 'mute' THEN 1 ELSE 0 END) AS mutes,
+      SUM(CASE WHEN al.action = 'report_claim' THEN 1 ELSE 0 END) AS reports_claimed,
+      SUM(CASE WHEN al.action = 'report_status'
+               AND JSON_UNQUOTE(JSON_EXTRACT(al.details, '$.status')) = 'closed'
+               THEN 1 ELSE 0 END) AS reports_closed,
+      MIN(al.created_at) AS first_action_at,
+      MAX(al.created_at) AS last_action_at,
+      (
+        SELECT COALESCE(SUM(LEAST(
+          TIMESTAMPDIFF(SECOND, s.connected_at, COALESCE(s.disconnected_at, UTC_TIMESTAMP())),
+          28800
+        )), 0)
+        FROM ti_live_player_sessions s
+        WHERE s.primary_identifier = al.actor_identifier
+        ${periodWhereSessions}
+      ) AS playtime_seconds,
+      (SELECT COUNT(*) FROM ti_bans b WHERE b.created_by_identifier = al.actor_identifier AND b.revoked_at IS NOT NULL) AS bans_revoked_total,
+      (SELECT COUNT(*) FROM ti_bans b WHERE b.created_by_identifier = al.actor_identifier) AS bans_total
+    FROM ti_audit_logs al
+    WHERE al.actor_identifier NOT IN ('system', '')
+    ${periodWhereAl}
+    GROUP BY al.actor_identifier, al.actor_name
     ORDER BY total_actions DESC
     LIMIT 100
   `)
-  res.json({ rows, period })
+  const enriched = rows.map(r => ({
+    ...r,
+    discord_id: (String(r.all_identifiers || '').split(',').find(id => id.startsWith('discord:')) || '').replace('discord:', '') || null,
+    steam_hex:  (String(r.all_identifiers || '').split(',').find(id => id.startsWith('steam:'))   || '').replace('steam:',   '') || null,
+  }))
+  res.json({ rows: enriched, period })
+})
+
+// GET /api/admin/stats/reports
+// Overall report statistics: overview totals, by-type breakdown, top closers (7d + 30d).
+router.get('/stats/reports', requireAuth, requirePermission('ti.audit.view'), async (req, res) => {
+  const [overviewRows, byType, topClosers7d, topClosers30d] = await Promise.all([
+    query(`
+      SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN status IN ('open','claimed','in_progress') THEN 1 ELSE 0 END) AS open_count,
+        SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed_total,
+        SUM(CASE WHEN status = 'closed' AND updated_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 DAY)  THEN 1 ELSE 0 END) AS closed_today,
+        SUM(CASE WHEN status = 'closed' AND updated_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 7 DAY)  THEN 1 ELSE 0 END) AS closed_7d,
+        SUM(CASE WHEN status = 'closed' AND updated_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 30 DAY) THEN 1 ELSE 0 END) AS closed_30d,
+        ROUND(AVG(CASE WHEN status = 'closed' THEN TIMESTAMPDIFF(MINUTE, created_at, updated_at) ELSE NULL END) / 60, 1) AS avg_resolution_hours
+      FROM ti_reports
+    `),
+    query(`
+      SELECT report_type,
+        COUNT(*) AS total,
+        SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed,
+        SUM(CASE WHEN status IN ('open','claimed','in_progress') THEN 1 ELSE 0 END) AS open_count
+      FROM ti_reports
+      GROUP BY report_type
+      ORDER BY total DESC
+    `),
+    query(`
+      SELECT al.actor_name, al.actor_identifier,
+        SUM(CASE WHEN al.action = 'report_claim' THEN 1 ELSE 0 END) AS claimed,
+        SUM(CASE WHEN al.action = 'report_status'
+             AND JSON_UNQUOTE(JSON_EXTRACT(al.details, '$.status')) = 'closed'
+             THEN 1 ELSE 0 END) AS closed
+      FROM ti_audit_logs al
+      WHERE al.actor_identifier NOT IN ('system','')
+        AND al.action IN ('report_claim','report_status')
+        AND al.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+      GROUP BY al.actor_identifier, al.actor_name
+      HAVING (claimed > 0 OR closed > 0)
+      ORDER BY closed DESC, claimed DESC
+      LIMIT 10
+    `),
+    query(`
+      SELECT al.actor_name, al.actor_identifier,
+        SUM(CASE WHEN al.action = 'report_claim' THEN 1 ELSE 0 END) AS claimed,
+        SUM(CASE WHEN al.action = 'report_status'
+             AND JSON_UNQUOTE(JSON_EXTRACT(al.details, '$.status')) = 'closed'
+             THEN 1 ELSE 0 END) AS closed
+      FROM ti_audit_logs al
+      WHERE al.actor_identifier NOT IN ('system','')
+        AND al.action IN ('report_claim','report_status')
+        AND al.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+      GROUP BY al.actor_identifier, al.actor_name
+      HAVING (claimed > 0 OR closed > 0)
+      ORDER BY closed DESC, claimed DESC
+      LIMIT 10
+    `)
+  ])
+
+  res.json({
+    overview: overviewRows[0] || {},
+    byType,
+    topClosers: { '7d': topClosers7d, '30d': topClosers30d }
+  })
 })
 
 // ─── Shared helper: proxy a request to the FiveM game server ─────────────────
@@ -547,6 +666,23 @@ router.post('/resources/:name/control', requireAuth, async (req, res) => {
 
 // ─── Player action routes ─────────────────────────────────────────────────────
 
+// POST /api/admin/player/warn
+router.post('/player/warn', requireAuth, requirePermission('ti.admin.warn'), async (req, res) => {
+  const src     = Number(req.body.src)
+  const message = String(req.body.message || '').trim().slice(0, 512)
+  if (!src || !message) return res.status(400).json({ error: 'invalid_payload' })
+  try {
+    await callFivem('/player-warn', 'POST', { src, message })
+    await writeAdminLog({ req, action: 'web_warn', target: String(src), details: { message },
+      discordEmbed: { title: 'Player Warned', color: 15787023,
+        fields: [{ name: 'Admin', value: req.user.name, inline: true }, { name: 'Player ID', value: String(src), inline: true }, { name: 'Reason', value: message }] }
+    })
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(502).json({ error: 'fivem_unreachable', detail: err.message })
+  }
+})
+
 // POST /api/admin/player/kick
 router.post('/player/kick', requireAuth, requirePermission('ti.ban.create'), async (req, res) => {
   const src    = Number(req.body.src)
@@ -654,12 +790,20 @@ router.get('/all-players', requireAuth, requirePermission('ti.ban.view'), async 
   try {
     const searchClause = search ? `AND (lps.player_name LIKE ? OR lps.primary_identifier LIKE ?)` : ''
     const searchArgs   = search ? [`%${search}%`, `%${search}%`] : []
+    // INNER JOIN on latest session prevents duplicate rows when a player has
+    // multiple historical session records in ti_live_player_sessions.
     const rows = await query(
       `SELECT lps.player_src, lps.player_name, lps.primary_identifier,
               GROUP_CONCAT(lsi.identifier ORDER BY lsi.identifier SEPARATOR ',') AS identifiers,
               lps.last_seen_at, lps.disconnected_at,
               (lps.disconnected_at IS NULL AND lps.last_seen_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 3 MINUTE)) AS is_online
        FROM ti_live_player_sessions lps
+       INNER JOIN (
+         SELECT primary_identifier, MAX(last_seen_at) AS max_seen
+         FROM ti_live_player_sessions
+         GROUP BY primary_identifier
+       ) latest ON latest.primary_identifier = lps.primary_identifier
+               AND latest.max_seen = lps.last_seen_at
        LEFT JOIN ti_live_player_session_identifiers lsi ON lsi.session_id = lps.id
        WHERE 1=1 ${searchClause}
        GROUP BY lps.id
