@@ -31,7 +31,7 @@ export async function getDiscordGuildMemberRoleIds(userId) {
   return Array.isArray(data.roles) ? data.roles.map((value) => String(value)) : []
 }
 
-export async function sendDiscordDM(userId, message) {
+export async function sendDiscordDM(userId, messageOrEmbed) {
   const settings = await getPanelSettings()
   const botToken = settings.discordBotToken
   if (!botToken || !userId) return false
@@ -44,10 +44,16 @@ export async function sendDiscordDM(userId, message) {
   if (!channelRes.ok) return false
 
   const channel = await channelRes.json()
+
+  // Support plain string or embed object
+  const payload = typeof messageOrEmbed === 'string'
+    ? { content: String(messageOrEmbed).slice(0, 1900) }
+    : { embeds: [messageOrEmbed] }
+
   const msgRes = await fetch(`${DISCORD_API_BASE}/channels/${channel.id}/messages`, {
     method: 'POST',
     headers: { Authorization: `Bot ${botToken}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ content: String(message).slice(0, 1900) })
+    body: JSON.stringify(payload)
   })
   return msgRes.ok
 }

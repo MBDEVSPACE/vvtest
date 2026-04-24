@@ -1,12 +1,21 @@
 import { Router } from 'express'
-import { sendDiscordLog, sendDiscordFile } from '../services/logs.js'
+import { sendDiscordLog, sendDiscordEmbed, sendDiscordFile } from '../services/logs.js'
 import { getPanelSettings } from '../services/panelSettings.js'
 
 const router = Router()
 
+// Action → embed color
+const ACTION_COLORS = {
+  ban_create: 15158332, ban_unban: 3066993, kick: 16744448,
+  warn: 15787023, screenshot: 54527, report: 3447003,
+  mute: 15787023, default: 9833894
+}
+function embedColor(action) {
+  const key = Object.keys(ACTION_COLORS).find(k => action.startsWith(k))
+  return key ? ACTION_COLORS[key] : ACTION_COLORS.default
+}
+
 // POST /api/ingest/game-log
-// Called by ti_admin server after every audit action.
-// Protected by the shared secret set in Config.WebPanel.SharedSecret (ti_admin) and TI_SHARED_SECRET (.env here).
 router.post('/game-log', async (req, res) => {
   const expectedSecret = process.env.TI_SHARED_SECRET || ''
   const incoming = String(req.headers['x-ti-secret'] || '').trim()
@@ -21,28 +30,38 @@ router.post('/game-log', async (req, res) => {
     return res.status(400).json({ error: 'invalid_payload' })
   }
 
-  const safeActor = String(actorName || 'unknown').slice(0, 80)
+  const safeActor  = String(actorName || 'unknown').slice(0, 80)
   const safeTarget = String(target || 'n/a').slice(0, 80)
   const safeAction = String(action).slice(0, 64)
-
-  const detailStr = details && typeof details === 'object'
-    ? Object.entries(details).map(([k, v]) => `${k}=${v}`).join(' ').slice(0, 200)
-    : ''
-
-  const discordMessage = detailStr
-    ? `[In-Game] **${safeActor}** \`${safeAction}\` → \`${safeTarget}\` (${detailStr})`
-    : `[In-Game] **${safeActor}** \`${safeAction}\` → \`${safeTarget}\``
 
   try {
     if (safeAction === 'admin_chat_export') {
       const transcript = typeof details?.transcript === 'string' ? details.transcript : ''
       if (transcript) {
-        const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+        const stamp   = new Date().toISOString().replace(/[:.]/g, '-')
         const caption = `📋 **Admin Chat Transcript** cleared by **${safeActor}** at ${new Date().toUTCString()}`
         await sendDiscordFile(transcript, `admin-chat-${stamp}.txt`, caption)
       }
     } else {
-      await sendDiscordLog(discordMessage)
+      // Build rich embed from in-game action
+      const fields = [
+        { name: 'Admin', value: safeActor, inline: true },
+        { name: 'Target', value: safeTarget, inline: true },
+      ]
+      if (details && typeof details === 'object') {
+        for (const [k, v] of Object.entries(details)) {
+          if (v !== undefined && v !== null && String(v) !== '') {
+            fields.push({ name: k, value: String(v).slice(0, 256), inline: true })
+          }
+        }
+      }
+      await sendDiscordEmbed({
+        title:     `[In-Game] ${safeAction.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}`,
+        color:     embedColor(safeAction),
+        fields:    fields.slice(0, 10),
+        footer:    { text: 'TI Admin · In-Game' },
+        timestamp: new Date().toISOString(),
+      })
     }
   } catch (err) {
     console.error('[web-panel] game-log discord failed', err)

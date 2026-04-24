@@ -30,7 +30,7 @@ async function getAccessPayload(req) {
 
   const [roles, assignments] = await Promise.all([
     query(
-      `SELECT r.id, r.name, r.label, r.weight, r.is_super,
+      `SELECT r.id, r.name, r.label, r.weight, r.is_super, r.color,
               COALESCE(GROUP_CONCAT(DISTINCT p.permission ORDER BY p.permission SEPARATOR ','), '') AS permissions
        FROM ti_admin_roles r
        LEFT JOIN ti_admin_permissions p ON p.role_id = r.id
@@ -52,6 +52,7 @@ async function getAccessPayload(req) {
     roles: roles.map((role) => ({
       ...role,
       is_super: Number(role.is_super || 0) === 1,
+      color: role.color || '#9db0be',
       permissions: String(role.permissions || '')
         .split(',')
         .map((value) => value.trim())
@@ -151,6 +152,7 @@ router.put('/roles/:roleId', requireAuth, requirePermission('ti.admin.manage_per
   const label = String(req.body.label || '').trim().slice(0, 64)
   const weight = Number(req.body.weight || 0)
   const isSuper = req.body.is_super ? 1 : 0
+  const color = /^#[0-9a-fA-F]{3,8}$/.test(req.body.color || '') ? req.body.color : null
   const permissions = Array.isArray(req.body.permissions)
     ? req.body.permissions.map((value) => String(value || '').trim()).filter(Boolean)
     : []
@@ -162,9 +164,11 @@ router.put('/roles/:roleId', requireAuth, requirePermission('ti.admin.manage_per
 
   await query(
     `UPDATE ti_admin_roles
-     SET name = ?, label = ?, weight = ?, is_super = ?
+     SET name = ?, label = ?, weight = ?, is_super = ?${color !== null ? ', color = ?' : ''}
      WHERE id = ?`,
-    [name || roleRows[0].name, label || roleRows[0].name, weight, isSuper, roleId]
+    color !== null
+      ? [name || roleRows[0].name, label || roleRows[0].name, weight, isSuper, color, roleId]
+      : [name || roleRows[0].name, label || roleRows[0].name, weight, isSuper, roleId]
   )
 
   await writeRolePermissions(roleId, permissions)
@@ -173,7 +177,7 @@ router.put('/roles/:roleId', requireAuth, requirePermission('ti.admin.manage_per
     req,
     action: 'web_role_update',
     target: String(roleId),
-    details: { name, label, weight, isSuper, permissions },
+    details: { name, label, weight, isSuper, color, permissions },
     discordMessage: `[Admin Panel] ${req.user.name} updated role #${roleId}`
   })
 
@@ -185,6 +189,7 @@ router.post('/roles', requireAuth, requirePermission('ti.admin.manage_permission
   const label = String(req.body.label || '').trim().slice(0, 64)
   const weight = Number(req.body.weight || 0)
   const isSuper = req.body.is_super ? 1 : 0
+  const color = /^#[0-9a-fA-F]{3,8}$/.test(req.body.color || '') ? req.body.color : '#9db0be'
   const permissions = Array.isArray(req.body.permissions)
     ? req.body.permissions.map((value) => String(value || '').trim()).filter(Boolean)
     : []
@@ -194,9 +199,9 @@ router.post('/roles', requireAuth, requirePermission('ti.admin.manage_permission
   }
 
   const result = await query(
-    `INSERT INTO ti_admin_roles (name, label, weight, is_super)
-     VALUES (?, ?, ?, ?)`,
-    [name, label, weight, isSuper]
+    `INSERT INTO ti_admin_roles (name, label, weight, is_super, color)
+     VALUES (?, ?, ?, ?, ?)`,
+    [name, label, weight, isSuper, color]
   )
 
   await writeRolePermissions(result.insertId, permissions)
@@ -205,7 +210,7 @@ router.post('/roles', requireAuth, requirePermission('ti.admin.manage_permission
     req,
     action: 'web_role_create',
     target: String(result.insertId),
-    details: { name, label, weight, isSuper, permissions },
+    details: { name, label, weight, isSuper, color, permissions },
     discordMessage: `[Admin Panel] ${req.user.name} created role ${label}`
   })
 
@@ -403,13 +408,13 @@ router.get('/stats/staff', requireAuth, requirePermission('ti.audit.view'), asyn
 })
 
 // ─── Shared helper: proxy a request to the FiveM game server ─────────────────
-async function callFivem(path, method = 'POST', body = null) {
+async function callFivem(path, method = 'POST', body = null, timeoutMs = 6000) {
   const fivemUrl = (process.env.FIVEM_SERVER_URL || '').trim()
   if (!fivemUrl) throw new Error('FIVEM_SERVER_URL not configured')
   const opts = {
     method,
     headers: { 'x-ti-secret': process.env.TI_SHARED_SECRET || '' },
-    signal: AbortSignal.timeout(6000)
+    signal: AbortSignal.timeout(timeoutMs)
   }
   if (body !== null) {
     opts.headers['Content-Type'] = 'application/json'
@@ -537,6 +542,233 @@ router.post('/resources/:name/control', requireAuth, async (req, res) => {
     res.json(data)
   } catch (err) {
     res.status(502).json({ error: 'fivem_unreachable', detail: err.message })
+  }
+})
+
+// ─── Player action routes ─────────────────────────────────────────────────────
+
+// POST /api/admin/player/kick
+router.post('/player/kick', requireAuth, requirePermission('ti.ban.create'), async (req, res) => {
+  const src    = Number(req.body.src)
+  const reason = String(req.body.reason || 'Kicked by admin').trim().slice(0, 256)
+  if (!src) return res.status(400).json({ error: 'invalid_src' })
+  try {
+    await callFivem('/player-kick', 'POST', { src, reason })
+    await writeAdminLog({ req, action: 'web_kick', target: String(src), details: { reason },
+      discordEmbed: { title: 'Player Kicked', color: 16744448,
+        fields: [{ name: 'Admin', value: req.user.name, inline: true }, { name: 'Player ID', value: String(src), inline: true }, { name: 'Reason', value: reason }] }
+    })
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(502).json({ error: 'fivem_unreachable', detail: err.message })
+  }
+})
+
+// POST /api/admin/player/set-job
+router.post('/player/set-job', requireAuth, requirePermission('ti.admin.manage_permissions'), async (req, res) => {
+  const src    = Number(req.body.src)
+  const job    = String(req.body.job || '').trim().slice(0, 64)
+  const grade  = Math.max(0, Math.min(20, Number(req.body.grade) || 0))
+  const isGang = req.body.isGang === true
+  if (!src || !job) return res.status(400).json({ error: 'invalid_payload' })
+  try {
+    await callFivem('/player-set-job', 'POST', { src, job, grade, isGang })
+    await writeAdminLog({ req, action: 'web_set_job', target: String(src), details: { job, grade, isGang },
+      discordEmbed: { title: isGang ? 'Gang Set' : 'Job Set', color: 10181046,
+        fields: [{ name: 'Admin', value: req.user.name, inline: true }, { name: 'Player ID', value: String(src), inline: true }, { name: isGang ? 'Gang' : 'Job', value: `${job} (grade ${grade})`, inline: true }] }
+    })
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(502).json({ error: 'fivem_unreachable', detail: err.message })
+  }
+})
+
+// POST /api/admin/player-action
+// Runs a targeted in-game admin action (spectate / goto / bring / sendBack / gotoBack)
+// on behalf of the signed-in panel user who must also be in-game.
+router.post('/player-action', requireAuth, requirePermission('ti.map.view'), async (req, res) => {
+  const ALLOWED = ['spectate', 'goto', 'bring', 'sendBack', 'gotoBack']
+  const action    = String(req.body.action    || '').trim()
+  const targetSrc = req.body.targetSrc != null ? Number(req.body.targetSrc) : null
+  if (!ALLOWED.includes(action)) return res.status(400).json({ error: 'invalid_action' })
+  try {
+    const data = await callFivem('/player-action', 'POST', {
+      adminIdentifier: req.user.identifier,
+      action,
+      targetSrc,
+    }, 5000)
+    res.json(data)
+  } catch (err) {
+    res.status(502).json({ error: 'fivem_unreachable', detail: err.message })
+  }
+})
+
+// GET /api/admin/map-snapshot
+// Returns live player positions with roles directly from the FiveM server.
+// Bypasses the DB entirely — no need for ti_player_locs migration.
+router.get('/map-snapshot', requireAuth, requirePermission('ti.map.view'), async (_req, res) => {
+  try {
+    const players = await callFivem('/map-snapshot', 'GET', null, 4000)
+    // Normalise to { src, name, role, coords: {x,y,z}, ... }
+    const mapped = (Array.isArray(players) ? players : []).map((p) => ({
+      src:     p.src,
+      name:    p.name,
+      role:    p.role || 'user',
+      inVeh:   p.inVeh  || false,
+      isDead:  p.isDead || false,
+      ping:    p.ping   || 0,
+      job:     p.job    || '',
+      onDuty:  p.onDuty || false,
+      coords:  { x: p.x || 0, y: p.y || 0, z: p.z || 0 },
+    }))
+    res.json({ players: mapped })
+  } catch (err) {
+    res.status(502).json({ error: 'fivem_unreachable', detail: err.message })
+  }
+})
+
+// POST /api/admin/broadcast
+router.post('/broadcast', requireAuth, requirePermission('ti.admin.manage_permissions'), async (req, res) => {
+  const message = String(req.body.message || '').trim().slice(0, 512)
+  const color   = String(req.body.color || 'info').slice(0, 16)
+  const icon    = String(req.body.icon  || 'fa-solid fa-bullhorn').slice(0, 96)
+  if (!message) return res.status(400).json({ error: 'message_required' })
+  try {
+    await callFivem('/broadcast', 'POST', { message, color, icon })
+    await writeAdminLog({ req, action: 'web_broadcast', target: 'all', details: { message, color, icon },
+      discordEmbed: { title: 'Server Announcement', color: 3447003,
+        fields: [{ name: 'Admin', value: req.user.name, inline: true }, { name: 'Color', value: color, inline: true }, { name: 'Message', value: message }] }
+    })
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(502).json({ error: 'fivem_unreachable', detail: err.message })
+  }
+})
+
+// GET /api/admin/all-players?search=&limit=100
+// Returns recently-seen players (online + offline) from session history.
+// Online flag is derived from last_seen_at freshness.
+router.get('/all-players', requireAuth, requirePermission('ti.ban.view'), async (req, res) => {
+  const search = String(req.query.search || '').trim().slice(0, 80)
+  const limit  = Math.min(parseInt(req.query.limit) || 100, 200)
+  try {
+    const searchClause = search ? `AND (lps.player_name LIKE ? OR lps.primary_identifier LIKE ?)` : ''
+    const searchArgs   = search ? [`%${search}%`, `%${search}%`] : []
+    const rows = await query(
+      `SELECT lps.player_src, lps.player_name, lps.primary_identifier,
+              GROUP_CONCAT(lsi.identifier ORDER BY lsi.identifier SEPARATOR ',') AS identifiers,
+              lps.last_seen_at, lps.disconnected_at,
+              (lps.disconnected_at IS NULL AND lps.last_seen_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 3 MINUTE)) AS is_online
+       FROM ti_live_player_sessions lps
+       LEFT JOIN ti_live_player_session_identifiers lsi ON lsi.session_id = lps.id
+       WHERE 1=1 ${searchClause}
+       GROUP BY lps.id
+       ORDER BY lps.last_seen_at DESC
+       LIMIT ?`,
+      [...searchArgs, limit]
+    )
+    const players = rows.map((row) => {
+      const idList = String(row.identifiers || '').split(',').filter(Boolean)
+      if (!idList.length && row.primary_identifier) idList.push(row.primary_identifier)
+      return {
+        src:          row.is_online ? row.player_src : null,
+        name:         row.player_name,
+        identifier:   row.primary_identifier,
+        identifiers:  idList,
+        is_online:    Boolean(row.is_online),
+        last_seen_at: row.last_seen_at,
+        coords:       null,
+      }
+    })
+    res.json({ players })
+  } catch (err) {
+    console.error('[web-panel] all-players query failed', err)
+    res.status(500).json({ error: 'internal_error', detail: err?.message })
+  }
+})
+
+// POST /api/admin/player/screenshot
+router.post('/player/screenshot', requireAuth, requirePermission('ti.ban.create'), async (req, res) => {
+  const src     = Number(req.body.src)
+  const context = String(req.body.context || 'web_panel').slice(0, 64)
+  if (!src) return res.status(400).json({ error: 'invalid_src' })
+  try {
+    const data = await callFivem('/player-screenshot', 'POST', { src, context }, 12000)
+    await writeAdminLog({ req, action: 'web_screenshot', target: String(src), details: { context, imageUrl: data.imageUrl } })
+    res.json(data)
+  } catch (err) {
+    res.status(502).json({ error: 'fivem_unreachable', detail: err.message })
+  }
+})
+
+// POST /api/admin/player/screenshot-poll
+router.post('/player/screenshot-poll', requireAuth, requirePermission('ti.ban.create'), async (req, res) => {
+  const token = String(req.body.token || '').trim()
+  if (!token) return res.status(400).json({ error: 'token_required' })
+  try {
+    const data = await callFivem('/screenshot-poll', 'POST', { token }, 4000)
+    res.json(data)
+  } catch (err) {
+    res.status(502).json({ error: 'fivem_unreachable', detail: err.message })
+  }
+})
+
+// GET /api/admin/player/:src/inventory
+router.get('/player/:src/inventory', requireAuth, requirePermission('ti.ban.create'), async (req, res) => {
+  const src = Number(req.params.src)
+  if (!src) return res.status(400).json({ error: 'invalid_src' })
+  try {
+    const data = await callFivem('/player-inventory', 'POST', { src })
+    res.json(data)
+  } catch (err) {
+    res.status(502).json({ error: 'fivem_unreachable', detail: err.message })
+  }
+})
+
+// GET /api/admin/player/:identifier/vehicles
+router.get('/player/:identifier/vehicles', requireAuth, requirePermission('ti.ban.create'), async (req, res) => {
+  const identifier = String(req.params.identifier || '').trim().slice(0, 120)
+  if (!identifier) return res.status(400).json({ error: 'invalid_identifier' })
+  try {
+    const data = await callFivem('/player-vehicles', 'POST', { identifier })
+    res.json(data)
+  } catch (err) {
+    res.status(502).json({ error: 'fivem_unreachable', detail: err.message })
+  }
+})
+
+// GET /api/admin/player/:identifier/warns
+router.get('/player/:identifier/warns', requireAuth, requirePermission('ti.admin.warn'), async (req, res) => {
+  const identifier = String(req.params.identifier || '').trim().slice(0, 120)
+  if (!identifier) return res.status(400).json({ error: 'invalid_identifier' })
+  try {
+    const rows = await query(
+      `SELECT id, warned_by_name, message, created_at
+       FROM ti_warnings WHERE target_identifier = ?
+       ORDER BY created_at DESC LIMIT 50`,
+      [identifier]
+    )
+    res.json({ rows })
+  } catch (err) {
+    res.status(500).json({ error: 'db_error', detail: err.message })
+  }
+})
+
+// GET /api/admin/player/:identifier/reports
+router.get('/player/:identifier/reports', requireAuth, requirePermission('ti.audit.view'), async (req, res) => {
+  const identifier = String(req.params.identifier || '').trim().slice(0, 120)
+  if (!identifier) return res.status(400).json({ error: 'invalid_identifier' })
+  try {
+    const rows = await query(
+      `SELECT id, report_type, reporter_name, reported_name, message, status, claimed_by_name, created_at
+       FROM ti_reports
+       WHERE reporter_identifier = ? OR reported_identifier = ?
+       ORDER BY created_at DESC LIMIT 50`,
+      [identifier, identifier]
+    )
+    res.json({ rows })
+  } catch (err) {
+    res.status(500).json({ error: 'db_error', detail: err.message })
   }
 })
 

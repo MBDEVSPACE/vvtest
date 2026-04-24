@@ -147,12 +147,21 @@ router.post('/:id/status', requireAuth, requirePermission('ti.appeals.manage'), 
 
     if (appellantId.startsWith('discord:')) {
       const discordUserId = appellantId.slice(8)
-      const dmText = newStatus === 'accepted'
-        ? `${icon} Your ban appeal **#${id}** has been **accepted**. You may rejoin the server.`
-        : newStatus === 'denied'
-          ? `${icon} Your ban appeal **#${id}** has been **denied**.${adminResponse ? ` Staff note: ${adminResponse.slice(0, 300)}` : ''}`
-          : `${icon} Your ban appeal **#${id}** has been closed.`
-      sendDiscordDM(discordUserId, dmText).catch(() => {})
+      const statusLabel = newStatus === 'accepted' ? 'Accepted' : newStatus === 'denied' ? 'Denied' : 'Closed'
+      const icon = newStatus === 'accepted' ? '✅' : newStatus === 'denied' ? '❌' : '🔒'
+      const dmEmbed = {
+        title:       `${icon} Appeal #${id} — ${statusLabel}`,
+        color:       newStatus === 'accepted' ? 3066993 : newStatus === 'denied' ? 15158332 : 9833894,
+        description: newStatus === 'accepted'
+          ? 'Your ban appeal has been **accepted**. You may rejoin the server.'
+          : newStatus === 'denied'
+            ? `Your ban appeal has been **denied**.${adminResponse ? `\n\nStaff note: ${adminResponse.slice(0, 500)}` : ''}`
+            : 'Your ban appeal has been closed by staff.',
+        fields:   [{ name: 'Appeal ID', value: `#${id}`, inline: true }, { name: 'Handled By', value: req.user.name, inline: true }],
+        footer:   { text: 'TI Admin Panel' },
+        timestamp: new Date().toISOString(),
+      }
+      sendDiscordDM(discordUserId, dmEmbed).catch(() => {})
     }
   }
 
