@@ -11,7 +11,9 @@ export const AVAILABLE_PERMISSIONS = [
   'ti.admin.god',
   'ti.admin.kill',
   'ti.admin.warn',
+  'ti.admin.mute',
   'ti.admin.screenshot',
+  'ti.admin.view_identifiers',
   'ti.ban.view',
   'ti.ban.create',
   'ti.ban.edit',
@@ -32,5 +34,10 @@ export const AVAILABLE_PERMISSIONS = [
   'ti.economy.give_money',
   'ti.inventory.give_item',
   'ti.jobs.manage',
+  'ti.dashboard.view',
+  'ti.players.advanced_view',
+  'ti.analytics.view',
+  'ti.itemlookup.search',
+  'ti.itemlookup.inspect',
   '*'
 ]

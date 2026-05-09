@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { query } from '../db/pool.js'
 import { requireAuth } from '../middleware/auth.js'
 import { requirePermission } from '../middleware/permissions.js'
+import { hasPermission } from '../services/roles.js'
 import { AVAILABLE_PERMISSIONS } from '../services/permissionNodes.js'
 import { getPanelSettings, savePanelSettings } from '../services/panelSettings.js'
 import { writeAdminLog } from '../services/logs.js'
@@ -324,6 +325,15 @@ router.get('/online-players', requireAuth, requirePermission('ti.ban.view'), asy
     `)
   }
 
+  // Identifier prefixes considered sensitive — only shown to users with ti.admin.view_identifiers
+  const SENSITIVE_PREFIXES = ['ip:', 'hwid:', 'license:', 'license2:', 'steam:', 'xbl:', 'live:']
+  const canViewIdentifiers = hasPermission(req.user, 'ti.admin.view_identifiers')
+
+  function filterIds(idList) {
+    if (canViewIdentifiers) return idList
+    return idList.filter((id) => !SENSITIVE_PREFIXES.some((p) => id.startsWith(p)))
+  }
+
   function mapRows(rows) {
     return rows.map((row) => {
       const idList = String(row.identifiers || '').split(',').filter(Boolean)
@@ -332,7 +342,7 @@ router.get('/online-players', requireAuth, requirePermission('ti.ban.view'), asy
         src: row.player_src,
         name: row.player_name,
         identifier: row.primary_identifier,
-        identifiers: idList,
+        identifiers: filterIds(idList),
         coords: (row.coord_x != null) ? { x: row.coord_x, y: row.coord_y, z: row.coord_z } : null
       }
     })
@@ -814,11 +824,14 @@ router.get('/all-players', requireAuth, requirePermission('ti.ban.view'), async 
     const players = rows.map((row) => {
       const idList = String(row.identifiers || '').split(',').filter(Boolean)
       if (!idList.length && row.primary_identifier) idList.push(row.primary_identifier)
+      const SENSITIVE = ['ip:', 'hwid:', 'license:', 'license2:', 'steam:', 'xbl:', 'live:']
+      const canView   = hasPermission(req.user, 'ti.admin.view_identifiers')
+      const filtered  = canView ? idList : idList.filter((id) => !SENSITIVE.some((p) => id.startsWith(p)))
       return {
         src:          row.is_online ? row.player_src : null,
         name:         row.player_name,
         identifier:   row.primary_identifier,
-        identifiers:  idList,
+        identifiers:  filtered,
         is_online:    Boolean(row.is_online),
         last_seen_at: row.last_seen_at,
         coords:       null,
