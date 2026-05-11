@@ -629,7 +629,9 @@ router.delete('/tags/:id', requireAuth, requirePermission('ti.admin.manage_permi
 
 // POST /api/admin/console/exec
 router.post('/console/exec', requireAuth, async (req, res) => {
-  if (!isSuperAdmin(req)) return res.status(403).json({ error: 'superadmin_required' })
+  if (!isSuperAdmin(req) && !hasPermission(req.user, 'ti.web.console_exec')) {
+    return res.status(403).json({ error: 'forbidden', permission: 'ti.web.console_exec' })
+  }
 
   const cmd = String(req.body.cmd || '').trim().slice(0, 256)
   if (!cmd) return res.status(400).json({ error: 'empty_command' })
@@ -645,7 +647,9 @@ router.post('/console/exec', requireAuth, async (req, res) => {
 
 // GET /api/admin/resources
 router.get('/resources', requireAuth, async (req, res) => {
-  if (!isSuperAdmin(req)) return res.status(403).json({ error: 'superadmin_required' })
+  if (!isSuperAdmin(req) && !hasPermission(req.user, 'ti.web.resources.view')) {
+    return res.status(403).json({ error: 'forbidden', permission: 'ti.web.resources.view' })
+  }
 
   try {
     const data = await callFivem('/resources', 'GET')
@@ -657,7 +661,9 @@ router.get('/resources', requireAuth, async (req, res) => {
 
 // POST /api/admin/resources/:name/control
 router.post('/resources/:name/control', requireAuth, async (req, res) => {
-  if (!isSuperAdmin(req)) return res.status(403).json({ error: 'superadmin_required' })
+  if (!isSuperAdmin(req) && !hasPermission(req.user, 'ti.web.resources.control')) {
+    return res.status(403).json({ error: 'forbidden', permission: 'ti.web.resources.control' })
+  }
 
   const name   = String(req.params.name || '').trim()
   const action = String(req.body.action  || '').trim()
@@ -774,7 +780,7 @@ router.get('/map-snapshot', requireAuth, requirePermission('ti.map.view'), async
 })
 
 // POST /api/admin/broadcast
-router.post('/broadcast', requireAuth, requirePermission('ti.admin.manage_permissions'), async (req, res) => {
+router.post('/broadcast', requireAuth, requirePermission('ti.admin.announce'), async (req, res) => {
   const message = String(req.body.message || '').trim().slice(0, 512)
   const color   = String(req.body.color || 'info').slice(0, 16)
   const icon    = String(req.body.icon  || 'fa-solid fa-bullhorn').slice(0, 96)

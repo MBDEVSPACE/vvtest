@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { query } from '../db/pool.js'
 import { requireAuth } from '../middleware/auth.js'
 import { requirePermission } from '../middleware/permissions.js'
+import { hasPermission } from '../services/roles.js'
 import { AVAILABLE_PERMISSIONS } from '../services/permissionNodes.js'
 import { getPanelSettings, savePanelSettings } from '../services/panelSettings.js'
 import { writeAdminLog } from '../services/logs.js'
@@ -324,6 +325,15 @@ router.get('/online-players', requireAuth, requirePermission('ti.ban.view'), asy
     `)
   }
 
+  // Identifier prefixes considered sensitive — only shown to users with ti.admin.view_identifiers
+  const SENSITIVE_PREFIXES = ['ip:', 'hwid:', 'license:', 'license2:', 'steam:', 'xbl:', 'live:']
+  const canViewIdentifiers = hasPermission(req.user, 'ti.admin.view_identifiers')
+
+  function filterIds(idList) {
+    if (canViewIdentifiers) return idList
+    return idList.filter((id) => !SENSITIVE_PREFIXES.some((p) => id.startsWith(p)))
+  }
+
   function mapRows(rows) {
     return rows.map((row) => {
       const idList = String(row.identifiers || '').split(',').filter(Boolean)
@@ -332,7 +342,7 @@ router.get('/online-players', requireAuth, requirePermission('ti.ban.view'), asy
         src: row.player_src,
         name: row.player_name,
         identifier: row.primary_identifier,
-        identifiers: idList,
+        identifiers: filterIds(idList),
         coords: (row.coord_x != null) ? { x: row.coord_x, y: row.coord_y, z: row.coord_z } : null
       }
     })
@@ -351,7 +361,31 @@ router.get('/online-players', requireAuth, requirePermission('ti.ban.view'), asy
         throw coordErr
       }
     }
-    res.json({ players: mapRows(rows) })
+    const players = mapRows(rows)
+
+    // ── FiveM fallback ────────────────────────────────────────────────────────
+    // If the sessions table is empty (resource not yet writing sessions), fall
+    // back to the live FiveM map-snapshot so the players list is never blank
+    // while the server is reachable.
+    if (players.length === 0) {
+      try {
+        const snap = await callFivem('/map-snapshot', 'GET', null, 3000)
+        if (Array.isArray(snap) && snap.length > 0) {
+          return res.json({
+            players: snap.map(p => ({
+              src:         p.src,
+              name:        p.name,
+              identifier:  '',
+              identifiers: [],
+              coords:      p.x != null ? { x: p.x, y: p.y, z: p.z } : null,
+            })),
+            _source: 'fivem_fallback',
+          })
+        }
+      } catch { /* non-fatal — FiveM may be unreachable */ }
+    }
+
+    res.json({ players })
   } catch (err) {
     console.error('[web-panel] online-players query failed', err)
     const msg = String(err?.message || '').toLowerCase()
@@ -389,6 +423,13 @@ router.get('/stats/staff', requireAuth, requirePermission('ti.audit.view'), asyn
     SELECT
       al.actor_name,
       al.actor_identifier,
+      (
+        SELECT GROUP_CONCAT(DISTINCT lsi.identifier ORDER BY lsi.identifier SEPARATOR ',')
+        FROM ti_live_player_sessions lps2
+        JOIN ti_live_player_session_identifiers lsi ON lsi.session_id = lps2.id
+        WHERE lps2.primary_identifier = al.actor_identifier
+        LIMIT 1
+      ) AS all_identifiers,
       COUNT(*) AS total_actions,
       SUM(CASE WHEN al.action IN ('ban_create','tiban_command','ban_create_offline','offline_ban_create','web_ban_create') THEN 1 ELSE 0 END) AS bans_issued,
       SUM(CASE WHEN al.action IN ('ban_unban','web_ban_unban') THEN 1 ELSE 0 END) AS unbans,
@@ -424,7 +465,12 @@ router.get('/stats/staff', requireAuth, requirePermission('ti.audit.view'), asyn
     ORDER BY total_actions DESC
     LIMIT 100
   `)
-  res.json({ rows, period })
+  const enriched = rows.map(r => ({
+    ...r,
+    discord_id: (String(r.all_identifiers || '').split(',').find(id => id.startsWith('discord:')) || '').replace('discord:', '') || null,
+    steam_hex:  (String(r.all_identifiers || '').split(',').find(id => id.startsWith('steam:'))   || '').replace('steam:',   '') || null,
+  }))
+  res.json({ rows: enriched, period })
 })
 
 // GET /api/admin/stats/reports
@@ -583,7 +629,9 @@ router.delete('/tags/:id', requireAuth, requirePermission('ti.admin.manage_permi
 
 // POST /api/admin/console/exec
 router.post('/console/exec', requireAuth, async (req, res) => {
-  if (!isSuperAdmin(req)) return res.status(403).json({ error: 'superadmin_required' })
+  if (!isSuperAdmin(req) && !hasPermission(req.user, 'ti.web.console_exec')) {
+    return res.status(403).json({ error: 'forbidden', permission: 'ti.web.console_exec' })
+  }
 
   const cmd = String(req.body.cmd || '').trim().slice(0, 256)
   if (!cmd) return res.status(400).json({ error: 'empty_command' })
@@ -599,7 +647,9 @@ router.post('/console/exec', requireAuth, async (req, res) => {
 
 // GET /api/admin/resources
 router.get('/resources', requireAuth, async (req, res) => {
-  if (!isSuperAdmin(req)) return res.status(403).json({ error: 'superadmin_required' })
+  if (!isSuperAdmin(req) && !hasPermission(req.user, 'ti.web.resources.view')) {
+    return res.status(403).json({ error: 'forbidden', permission: 'ti.web.resources.view' })
+  }
 
   try {
     const data = await callFivem('/resources', 'GET')
@@ -611,7 +661,9 @@ router.get('/resources', requireAuth, async (req, res) => {
 
 // POST /api/admin/resources/:name/control
 router.post('/resources/:name/control', requireAuth, async (req, res) => {
-  if (!isSuperAdmin(req)) return res.status(403).json({ error: 'superadmin_required' })
+  if (!isSuperAdmin(req) && !hasPermission(req.user, 'ti.web.resources.control')) {
+    return res.status(403).json({ error: 'forbidden', permission: 'ti.web.resources.control' })
+  }
 
   const name   = String(req.params.name || '').trim()
   const action = String(req.body.action  || '').trim()
@@ -629,6 +681,23 @@ router.post('/resources/:name/control', requireAuth, async (req, res) => {
 })
 
 // ─── Player action routes ─────────────────────────────────────────────────────
+
+// POST /api/admin/player/warn
+router.post('/player/warn', requireAuth, requirePermission('ti.admin.warn'), async (req, res) => {
+  const src     = Number(req.body.src)
+  const message = String(req.body.message || '').trim().slice(0, 512)
+  if (!src || !message) return res.status(400).json({ error: 'invalid_payload' })
+  try {
+    await callFivem('/player-warn', 'POST', { src, message })
+    await writeAdminLog({ req, action: 'web_warn', target: String(src), details: { message },
+      discordEmbed: { title: 'Player Warned', color: 15787023,
+        fields: [{ name: 'Admin', value: req.user.name, inline: true }, { name: 'Player ID', value: String(src), inline: true }, { name: 'Reason', value: message }] }
+    })
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(502).json({ error: 'fivem_unreachable', detail: err.message })
+  }
+})
 
 // POST /api/admin/player/kick
 router.post('/player/kick', requireAuth, requirePermission('ti.ban.create'), async (req, res) => {
@@ -711,7 +780,7 @@ router.get('/map-snapshot', requireAuth, requirePermission('ti.map.view'), async
 })
 
 // POST /api/admin/broadcast
-router.post('/broadcast', requireAuth, requirePermission('ti.admin.manage_permissions'), async (req, res) => {
+router.post('/broadcast', requireAuth, requirePermission('ti.admin.announce'), async (req, res) => {
   const message = String(req.body.message || '').trim().slice(0, 512)
   const color   = String(req.body.color || 'info').slice(0, 16)
   const icon    = String(req.body.icon  || 'fa-solid fa-bullhorn').slice(0, 96)
@@ -737,12 +806,20 @@ router.get('/all-players', requireAuth, requirePermission('ti.ban.view'), async 
   try {
     const searchClause = search ? `AND (lps.player_name LIKE ? OR lps.primary_identifier LIKE ?)` : ''
     const searchArgs   = search ? [`%${search}%`, `%${search}%`] : []
+    // INNER JOIN on latest session prevents duplicate rows when a player has
+    // multiple historical session records in ti_live_player_sessions.
     const rows = await query(
       `SELECT lps.player_src, lps.player_name, lps.primary_identifier,
               GROUP_CONCAT(lsi.identifier ORDER BY lsi.identifier SEPARATOR ',') AS identifiers,
               lps.last_seen_at, lps.disconnected_at,
               (lps.disconnected_at IS NULL AND lps.last_seen_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 3 MINUTE)) AS is_online
        FROM ti_live_player_sessions lps
+       INNER JOIN (
+         SELECT primary_identifier, MAX(last_seen_at) AS max_seen
+         FROM ti_live_player_sessions
+         GROUP BY primary_identifier
+       ) latest ON latest.primary_identifier = lps.primary_identifier
+               AND latest.max_seen = lps.last_seen_at
        LEFT JOIN ti_live_player_session_identifiers lsi ON lsi.session_id = lps.id
        WHERE 1=1 ${searchClause}
        GROUP BY lps.id
@@ -753,11 +830,14 @@ router.get('/all-players', requireAuth, requirePermission('ti.ban.view'), async 
     const players = rows.map((row) => {
       const idList = String(row.identifiers || '').split(',').filter(Boolean)
       if (!idList.length && row.primary_identifier) idList.push(row.primary_identifier)
+      const SENSITIVE = ['ip:', 'hwid:', 'license:', 'license2:', 'steam:', 'xbl:', 'live:']
+      const canView   = hasPermission(req.user, 'ti.admin.view_identifiers')
+      const filtered  = canView ? idList : idList.filter((id) => !SENSITIVE.some((p) => id.startsWith(p)))
       return {
         src:          row.is_online ? row.player_src : null,
         name:         row.player_name,
         identifier:   row.primary_identifier,
-        identifiers:  idList,
+        identifiers:  filtered,
         is_online:    Boolean(row.is_online),
         last_seen_at: row.last_seen_at,
         coords:       null,

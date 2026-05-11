@@ -105,6 +105,12 @@ router.get('/me', (req, res) => {
     canManageAppeals: hasPermission(user, 'ti.appeals.manage'),
     canViewAudit: hasPermission(user, 'ti.audit.view'),
     canManagePermissions: hasPermission(user, 'ti.admin.manage_permissions'),
+    canViewMap: hasPermission(user, 'ti.map.view'),
+    canManageTags: hasPermission(user, 'ti.tags.manage') || hasPermission(user, 'ti.admin.manage_permissions'),
+    canUseWebConsole: hasPermission(user, 'ti.web.console_exec'),
+    canViewResources: hasPermission(user, 'ti.web.resources.view'),
+    canControlResources: hasPermission(user, 'ti.web.resources.control'),
+    canBroadcast: hasPermission(user, 'ti.admin.announce') || hasPermission(user, 'ti.admin.manage_permissions'),
     isSuperAdmin: Boolean(user.role?.is_super)
   } : null
 
